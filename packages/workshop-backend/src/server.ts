@@ -1,7 +1,7 @@
 import { RpcStub, RpcTarget, newWorkersRpcResponse } from "capnweb";
 import { validateRpc } from "capnweb-validate";
 import type { JWTPayload } from "jose";
-import { PublicApi, AuthenticatedApi, Overseer, GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, AiGatewayInfo, AiModelProvider, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, AgentSpawnerConfig, WorkpieceId, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, CloudflareUsageInfo, CloudflareAccountOption, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, createOpenGadgetError, getOpenGadgetErrorCode, OPEN_GADGET_ERROR_CODES } from '@gadgets/workshop-shared/api';
+import { PublicApi, AuthenticatedApi, Overseer, GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, AiGatewayInfo, AiModelProvider, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, AgentSpawnerConfig, WorkpieceId, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, CloudflareUsageInfo, CloudflareAccountOption, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, createOpenGadgetError, getOpenGadgetErrorCode, OPEN_GADGET_ERROR_CODES, AUTH_ERROR_CODES, createAuthError } from '@gadgets/workshop-shared/api';
 import type { UiFeatureFlags } from "@gadgets/workshop-shared/feature-flags";
 import { getServerConfig } from "./deployment-config.js";
 import { isPasswordAuthEnabled, getAuthGatekeeperAllowlist } from "./auth/config.js";
@@ -28,6 +28,7 @@ import { verifyCfAccessJwt } from "./access.js";
 import { resolveUiFeatureFlags } from "./feature-flags";
 import { serveSiteLogo, SITE_LOGO_PATH } from "./site-logo.js";
 import { createWorkshopLogger } from "./observability";
+import { isDoResetError, retryOnDoReset } from "./do-retry";
 
 const logger = createWorkshopLogger("workshop.server");
 
@@ -71,13 +72,38 @@ type Env = Cloudflare.Env & {
 
 // =======================================================================================
 
+/** What UserDurableObject.subscribeConnectedAccounts returns, as seen from the Worker. Derived
+ * from the method rather than hand-written because the native stub's Unstubify type transform
+ * mangles capnweb stubs nested in returns, so the two call sites cast through this (same known
+ * type-system gap as the Overseer stub casts). */
+type UserSubscription = Awaited<ReturnType<UserDurableObject["subscribeConnectedAccounts"]>>;
+
+/** One browser subscription, held in the session's Worker context (which survives DO resets)
+ * so the DO-side registration can be re-created after the object's in-memory state dies.
+ *
+ * No relay sits between the DO and the browser: re-subscribing triggers the DO's normal
+ * catch-up replay (`add` for every current account, then `ready()`), and every browser
+ * subscriber reconciles it — repeat `add` for a known id is already the contract (the DO
+ * delivers updates through notifyAdd), and every `ready()` handler prunes accounts the replay
+ * did not re-send, so disconnects that happened while the registration was dead converge too. */
+interface SubscriptionEntry {
+  /** Worker-held dup of the browser's subscriber stub; passed to the DO on each (re-)subscribe. */
+  subscriber: RpcStub<ConnectedAccountsSubscriber>;
+  filter?: ConnectedAccountsFilter;
+  /** DO-minted disposer for the current registration; poisoned by a reset, replaced on
+   * re-subscribe. Disposal is always best-effort. */
+  doDisposer: RpcStub<{}>;
+  disposed: boolean;
+}
+
 @validateRpc()
 class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   constructor(private ctx: ExecutionContext, private env: Env,
-      private user: DurableObjectStub<UserDurableObject>,
+      userId: DurableObjectId,
       private abortSession: (reason: Error) => void) {
     super();
 
+    this.#userId = userId;
     this.overseers = this.ctx.exports.OverseerDurableObject;
     this.adminSettings = this.ctx.exports.AdminSettings;
     this.users = this.ctx.exports.UserDurableObject;
@@ -87,8 +113,184 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   private adminSettings: DurableObjectNamespace<AdminSettings>;
   private users: DurableObjectNamespace<UserDurableObject>;
 
+  #userId: DurableObjectId;
+
+  // A stub is bound to one incarnation of the DO and is permanently poisoned once that
+  // incarnation resets, so re-resolve per call instead of caching one for the session (per the
+  // DO error-handling docs: fresh stub per attempt). Stub creation is local and lazy — not a
+  // network call. The trade: e-order is guaranteed only per stub, so fresh stubs give up
+  // cross-call delivery ordering. No current call site issues a user-DO call before awaiting
+  // the one it depends on; an ordering-sensitive site must sequence explicitly (await), never
+  // assume delivery order. `#`-private because RpcTarget members are runtime-visible and TS
+  // `private` is erased.
+  get #user(): DurableObjectStub<UserDurableObject> {
+    return this.users.get(this.#userId);
+  }
+
+  // Every RPC into the user DO goes through #userRead or #userWrite — a naked `this.#user.x()`
+  // is a review defect. This is the single choke point that keeps routine DO resets (storage
+  // timeouts, overload aborts) from surfacing in the browser: workerd tags those rejections
+  // with structured flags right here in the Worker, one same-colo hop from the object, so
+  // recovery is cheap and needs no message matching.
+
+  /** Idempotent read against the user DO: fresh stub per attempt, one retry on reset. */
+  async #userRead<T>(operation: string,
+               fn: (user: DurableObjectStub<UserDurableObject>) => Promise<T>): Promise<T> {
+    let result = await retryOnDoReset(
+        () => fn(this.#user),
+        info => this.#onUserDoReset(operation, info.error, info.attempt, info.delayMs));
+    this.#maybeRevalidateSubscriptions();
+    return result;
+  }
+
+  /** Non-idempotent call: NO retry — a reset can land after the DO durably committed the write
+   * but before the response was delivered, so retrying could double-apply and the client must
+   * see the failure. Still observes reset flags (log + subscription recovery) and rethrows
+   * unchanged. */
+  async #userWrite<T>(operation: string,
+                      fn: (user: DurableObjectStub<UserDurableObject>) => Promise<T>): Promise<T> {
+    try {
+      let result = await fn(this.#user);
+      this.#maybeRevalidateSubscriptions();
+      return result;
+    } catch (e) {
+      if (isDoResetError(e)) this.#onUserDoReset(operation, e, 0, 0);
+      throw e;
+    }
+  }
+
+  /** Central reset observation point: keeps the reset volume visible in logs now that users
+   * stop seeing it, and (for sessions with live subscriptions) kicks off re-subscription. */
+  #onUserDoReset(operation: string, error: unknown, attempt: number, delayMs: number) {
+    logger.warn("user DO reset observed", {
+      event: "user_do.reset.recovered",
+      operation, attempt, durationMs: delayMs,
+      durableObjectId: this.#userId.toString(),
+      error,
+    });
+    this.#triggerRecovery();
+  }
+
+  // ── subscription recovery ─────────────────────────────────────────────────────────────────
+  //
+  // The DO holds subscriber registrations in memory only, so a reset destroys them while the
+  // browser's WebSocket stays healthy. Three detection paths feed #triggerRecovery:
+  //
+  //  1. Flags: a call that loses the race with the reset rejects with workerd's structured
+  //     flags → #onUserDoReset (production; local aborts reject flagless, see the integration
+  //     suite).
+  //  2. Incarnation drift: a call issued AFTER the reset simply restarts the object and
+  //     succeeds — no error to observe. So while subscriptions exist, successful user-DO calls
+  //     opportunistically trigger a recovery pass (throttled); the pass compares the object's
+  //     incarnation id against the one the registrations were made under and no-ops when they
+  //     match. This also heals registrations lost to plain idle eviction.
+  //  3. A new subscribe returning an unexpected incarnation id (see subscribeConnectedAccounts).
+  //
+  // TODO(stopgap): this entire incarnation-id + drift-polling design exists because workerd's
+  // native JSRPC stubs have no brokenness callback — the runtime equivalent of capnweb's
+  // `stub.onRpcBroken(cb)` (which exists for browser-side stubs today, but not for
+  // DurableObjectStub / native RPC as of 2026-08). When the runtime grows one,
+  // `doDisposer.onRpcBroken(() => this.#triggerRecovery())` makes recovery fully event-driven
+  // and deletes getIncarnationId(), the throttled check below, and the idle window with it.
+  //
+  // Residual window (deliberate, closed by the TODO above): a session that is completely idle
+  // after the reset learns nothing until its next user-DO call. A standing watchdog RPC would
+  // close it, but an awaited in-flight call pins the object in memory (blocks
+  // hibernation/eviction) for every open tab — not worth it. The client's socket-level
+  // reconnect remains the backstop. The staleness is silent (no error, no toast — the
+  // connected-accounts list just stops updating) and biased toward the worst moment: a user
+  // watching a page for a change that already happened in the DO (e.g. an OAuth connect
+  // completed in a popup).
+
+  #subscriptions = new Set<SubscriptionEntry>();
+  /** Incarnation the current registrations were made under; undefined until first subscribe.
+   * Only advanced by a fully successful recovery pass, so a failed or torn pass leaves it
+   * stale and the next trigger redoes the whole pass. */
+  #subscribedIncarnation: string | undefined;
+  /** Serializes recovery passes. Each pass re-checks drift first, so queued redundant
+   * triggers for the same reset coalesce into no-ops. */
+  #recoveryChain: Promise<void> = Promise.resolve();
+  #lastIncarnationCheck = 0;
+  static readonly #INCARNATION_CHECK_INTERVAL_MS = 30_000;
+
+  /** Cheap, throttled, fire-and-forget drift check — call after any successful user-DO RPC.
+   * Sync on purpose so callers never pay latency for it; the recovery pass itself compares
+   * incarnations and no-ops when the registrations are still live. */
+  #maybeRevalidateSubscriptions() {
+    if (this.#subscriptions.size === 0 || this.#subscribedIncarnation === undefined) return;
+    let now = Date.now();
+    if (now - this.#lastIncarnationCheck < AuthenticatedApiImpl.#INCARNATION_CHECK_INTERVAL_MS) {
+      return;
+    }
+    this.#lastIncarnationCheck = now;
+    this.#triggerRecovery();
+  }
+
+  /** Queues a recovery pass behind any in-flight one. Best-effort: a failed pass leaves
+   * #subscribedIncarnation stale, so the next trigger (flags or throttled check) retries. */
+  #triggerRecovery() {
+    this.#recoveryChain = this.#recoveryChain.then(() => this.#recoverSubscriptions());
+    this.ctx.waitUntil(this.#recoveryChain);
+  }
+
+  /** Re-subscribes every live registration against the (restarted) object, if the object's
+   * incarnation actually drifted. Runs serialized via #triggerRecovery, never rejects. */
+  async #recoverSubscriptions(): Promise<void> {
+    if (this.#subscriptions.size === 0 || this.#subscribedIncarnation === undefined) return;
+    try {
+      let incarnation = await this.#user.getIncarnationId();
+      if (incarnation === this.#subscribedIncarnation) return;
+      // Iterating the live Set is safe across the awaits below: an entry unsubscribed
+      // mid-pass is skipped (Set iterators tolerate deletion, plus the disposed check), and
+      // one added mid-pass at worst gets a harmless extra re-subscribe.
+      for (let entry of this.#subscriptions) {
+        if (entry.disposed) continue;
+        // Dispose the old DO-side registration FIRST: a no-op on a dead incarnation, and if
+        // this entry was already re-subscribed (e.g. by a pass that failed partway) it cleanly
+        // unsubscribes the live registration so the re-subscribe cannot double-deliver.
+        try { entry.doDisposer[Symbol.dispose](); } catch {}
+        // Plain fresh stub, not a choke-point wrapper: recovery must not recurse into reset
+        // handling; a failure here is handled by leaving #subscribedIncarnation stale (see
+        // catch). dup() because sending a stub over RPC transfers ownership of the sent handle.
+        let subscription = await this.#user.subscribeConnectedAccounts(
+            entry.subscriber.dup(), entry.filter) as unknown as UserSubscription;
+        if (entry.disposed) {
+          // Unsubscribed while the re-subscribe was in flight: nothing owns the registration
+          // just created, so tear it down instead of storing a disposer no one will call.
+          try { subscription.disposer[Symbol.dispose](); } catch {}
+          continue;
+        }
+        entry.doDisposer = subscription.disposer;
+        if (subscription.incarnationId !== incarnation) {
+          // The object reset AGAIN mid-pass: entries re-subscribed above are dead already.
+          // Fail the pass; the stale #subscribedIncarnation makes the next trigger redo it.
+          throw new Error("user DO reset again during subscription recovery");
+        }
+      }
+      this.#subscribedIncarnation = incarnation;
+      logger.info("re-subscribed after user DO reset", {
+        event: "user_do.subscription.recovered",
+        durableObjectId: this.#userId.toString(),
+      });
+    } catch (e) {
+      logger.warn("re-subscribe after user DO reset failed", {
+        event: "user_do.subscription.recover_failed",
+        durableObjectId: this.#userId.toString(),
+        error: e,
+      });
+    }
+  }
+
+  #unsubscribeEntry(entry: SubscriptionEntry) {
+    if (entry.disposed) return;
+    entry.disposed = true;
+    this.#subscriptions.delete(entry);
+    try { entry.doDisposer[Symbol.dispose](); } catch {}
+    entry.subscriber[Symbol.dispose]();
+  }
+
   #isAdmin(): boolean {
-    let name = this.user.id.name;
+    let name = this.#userId.name;
     let admins = this.env.ADMINS;
 
     if (!name || !admins) return false;
@@ -107,56 +309,56 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   }
 
   whoami(): Promise<AiChatAuthorInfo> {
-    return this.user.whoami();
+    return this.#userRead("whoami", u => u.whoami());
   }
   setOwnDisplayName(name: string): Promise<void> {
-    return this.user.setOwnDisplayName(name);
+    return this.#userWrite("setOwnDisplayName", u => u.setOwnDisplayName(name));
   }
   changePassword(oldHash: Uint8Array, newHash: Uint8Array): Promise<void> {
-    return this.user.changePassword(oldHash, newHash);
+    return this.#userWrite("changePassword", u => u.changePassword(oldHash, newHash));
   }
   hasPasswordLogin(): Promise<boolean> {
-    return this.user.hasPasswordLogin();
+    return this.#userRead("hasPasswordLogin", u => u.hasPasswordLogin());
   }
   listModels(): Promise<AiChatAuthorInfo[]> {
-    return this.user.listModels();
+    return this.#userRead("listModels", u => u.listModels());
   }
   addModel(profile: AiChatAuthorInfo, config: AiModelConfig): Promise<void> {
-    return this.user.addModel(profile, config);
+    return this.#userWrite("addModel", u => u.addModel(profile, config));
   }
   deleteModel(id: string): Promise<void> {
-    return this.user.deleteModel(id);
+    return this.#userWrite("deleteModel", u => u.deleteModel(id));
   }
   setQuickModel(id: string | null): Promise<void> {
-    return this.user.setQuickModel(id);
+    return this.#userWrite("setQuickModel", u => u.setQuickModel(id));
   }
   getQuickModel(): Promise<null | string> {
-    return this.user.getQuickModel();
+    return this.#userRead("getQuickModel", u => u.getQuickModel());
   }
 
   getPreferredModel(): Promise<string | null> {
-    return this.user.getPreferredModel();
+    return this.#userRead("getPreferredModel", u => u.getPreferredModel());
   }
   setPreferredModel(id: string | null): Promise<void> {
-    return this.user.setPreferredModel(id);
+    return this.#userWrite("setPreferredModel", u => u.setPreferredModel(id));
   }
   isOnboardingCompleted(): Promise<boolean> {
-    return this.user.isOnboardingCompleted();
+    return this.#userRead("isOnboardingCompleted", u => u.isOnboardingCompleted());
   }
   completeOnboarding(): Promise<void> {
-    return this.user.completeOnboarding();
+    return this.#userWrite("completeOnboarding", u => u.completeOnboarding());
   }
 
   getCloudflareUsage(): Promise<CloudflareUsageInfo> {
-    return getUsageInfo(this.env, this.user);
+    return this.#userRead("getCloudflareUsage", u => getUsageInfo(this.env, u));
   }
 
   listCloudflareAccounts(): Promise<CloudflareAccountOption[]> {
-    return listConnectedAccounts(this.env, this.user);
+    return this.#userRead("listCloudflareAccounts", u => listConnectedAccounts(this.env, u));
   }
 
   selectCloudflareAccount(accountId: string): Promise<void> {
-    return selectAccount(this.env, this.user, accountId);
+    return this.#userWrite("selectCloudflareAccount", u => selectAccount(this.env, u, accountId));
   }
 
   async setAvatar(data: Uint8Array | null): Promise<void> {
@@ -173,7 +375,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     }
     // Avatar data lives in KV (global), not the user's DO storage, so we
     // read/write it directly here to avoid routing through the DO location.
-    let userId = this.user.id.name!;
+    let userId = this.#userId.name!;
     if (data) {
       await this.env.AVATARS.put(userId, data);
     } else {
@@ -199,14 +401,14 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   }
 
   getUiFeatureFlags(): Promise<UiFeatureFlags> {
-    return resolveUiFeatureFlags(this.env, this.user.id.name!);
+    return resolveUiFeatureFlags(this.env, this.#userId.name!);
   }
 
   async #openGadgetInternal(id: string, shareKey?: string,
                             configureObservers?: RpcStub<ObserverConfigCallback>)
       : Promise<NativeRpcStub<Overseer>> {
-    let userId = this.user.id.toString();
-    let profileId = this.user.id.name!;
+    let userId = this.#userId.toString();
+    let profileId = this.#userId.name!;
     let overseerId;
     try {
       overseerId = this.overseers.idFromString(id);
@@ -247,7 +449,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
       // (refreshAffectedCollaboratorListings), but that push is best-effort. Only catches entries
       // they click; others stay frozen at revocation, as a disconnected collaborator gets no pushes.
       if (getOpenGadgetErrorCode(err) === OPEN_GADGET_ERROR_CODES.workspaceAccessDenied) {
-        await this.user.forgetSharedGadget(id);
+        await this.#userWrite("forgetSharedGadget", u => u.forgetSharedGadget(id));
       }
       throw err;
     }
@@ -271,10 +473,10 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
 
   async newGadget(): Promise<RpcStub<Overseer>> {
     let id = this.overseers.newUniqueId().toString();
-    await this.user.newGadget(id, "Untitled Workspace");
+    await this.#userWrite("newGadget", u => u.newGadget(id, "Untitled Workspace"));
     recordAnalytics(this.ctx, this.env, {
       event_name: "gadget_created",
-      user_id: this.user.id.toString(),
+      user_id: this.#userId.toString(),
       gadget_id: id,
       source: "blank",
     });
@@ -286,11 +488,11 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   }
 
   async listGadgets(): Promise<GadgetMetadataWithTimestamps[]> {
-    return this.user.listGadgets();
+    return this.#userRead("listGadgets", u => u.listGadgets());
   }
 
   listOutputs(): Promise<ListOutputsResult> {
-    return this.user.listOutputs();
+    return this.#userRead("listOutputs", u => u.listOutputs());
   }
 
   async listOutputFormats(): Promise<OutputFormatOffer[]> {
@@ -300,67 +502,107 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   }
 
   listGatekeeperVendors(filter?: GatekeeperVendorFilter): Promise<GatekeeperVendorInfo[]> {
-    return this.user.listGatekeeperVendors(filter);
+    return this.#userRead("listGatekeeperVendors", u => u.listGatekeeperVendors(filter));
   }
 
   connectAccount(vendorId: string, resourceUrlPatterns?: string[]): Promise<{url: string}> {
-    return this.user.connectAccount(vendorId, resourceUrlPatterns);
+    return this.#userWrite("connectAccount", u => u.connectAccount(vendorId, resourceUrlPatterns));
   }
 
   ensureAccountResources(accountId: number, resourceUrlPatterns: string[]): Promise<{url?: string}> {
-    return this.user.ensureAccountResources(accountId, resourceUrlPatterns);
+    return this.#userWrite("ensureAccountResources",
+        u => u.ensureAccountResources(accountId, resourceUrlPatterns));
   }
 
   listAddableGatekeepers(): Promise<GatekeeperVendorInfo[]> {
-    return this.user.listAddableGatekeepers();
+    return this.#userRead("listAddableGatekeepers", u => u.listAddableGatekeepers());
   }
 
   provisionAmbientAccount(vendorId: string): Promise<void> {
-    return this.user.provisionAmbientAccount(vendorId);
+    return this.#userWrite("provisionAmbientAccount", u => u.provisionAmbientAccount(vendorId));
   }
 
-  subscribeConnectedAccounts(
+  async subscribeConnectedAccounts(
       subscriber: RpcStub<ConnectedAccountsSubscriber>, filter?: ConnectedAccountsFilter)
       : Promise<RpcStub<{}>> {
-    return this.user.subscribeConnectedAccounts(subscriber, filter);
+    // Dup the browser's subscriber stub: the param handle dies when this call returns, but
+    // re-subscribing after a reset needs it for the life of the subscription. Sending a stub
+    // over RPC transfers ownership, so every (re-)subscribe sends its own dup() of this master
+    // and the master itself is only disposed by #unsubscribeEntry.
+    let kept = subscriber.dup();
+    let subscription: UserSubscription;
+    try {
+      // #userWrite, not #userRead: registration is not retry-safe. A `retryable` failure can
+      // land after the DO registered but before the response arrived, so a retry would leave a
+      // duplicate registration behind — and the includeForcedAutoProvisionedAccounts filter
+      // provisions accounts (see listGatekeeperApps). A subscribe raced by a reset surfaces to
+      // the component's fallback; the flags observed here still trigger recovery, which — with
+      // the next mount — heals it.
+      subscription = await this.#userWrite("subscribeConnectedAccounts",
+          async u => await u.subscribeConnectedAccounts(
+              kept.dup(), filter) as unknown as UserSubscription);
+    } catch (e) {
+      kept[Symbol.dispose]();
+      throw e;
+    }
+    let entry: SubscriptionEntry = {
+      subscriber: kept, filter, doDisposer: subscription.disposer, disposed: false,
+    };
+    this.#subscriptions.add(entry);
+
+    if (this.#subscribedIncarnation === undefined) {
+      this.#subscribedIncarnation = subscription.incarnationId;
+    } else if (this.#subscribedIncarnation !== subscription.incarnationId) {
+      // The object reset between an earlier subscribe and this one: the older registrations
+      // are already dead. Deliberately leave the stale incarnation in place so the recovery
+      // pass sees the drift and re-subscribes EVERY entry — redoing this one is harmless (its
+      // old registration is disposed first, and browser subscribers are replay-idempotent).
+      this.#triggerRecovery();
+    }
+
+    // Worker-minted disposer: unlike the DO-minted one it wraps, it survives resets, so the
+    // browser's dispose always cleanly tears down whichever registration is current.
+    let unsubscribe = () => this.#unsubscribeEntry(entry);
+    return new RpcStub<{}>({ [Symbol.dispose]() { unsubscribe(); } });
   }
 
   disconnectAccount(accountId: number): Promise<void> {
-    return this.user.disconnectAccount(accountId);
+    return this.#userWrite("disconnectAccount", u => u.disconnectAccount(accountId));
   }
 
   reconnectAccount(accountId: number): Promise<{url: string}> {
-    return this.user.reconnectAccount(accountId);
+    return this.#userWrite("reconnectAccount", u => u.reconnectAccount(accountId));
   }
 
   startResourceConfigurator(
       accountId: number,
       resourceUrlPattern: string) {
-    return this.user.startResourceConfigurator(accountId, resourceUrlPattern);
+    return this.#userWrite("startResourceConfigurator",
+        u => u.startResourceConfigurator(accountId, resourceUrlPattern));
   }
 
   async dismissSharedGadget(gadgetId: string): Promise<void> {
-    return this.user.forgetSharedGadget(gadgetId);
+    return this.#userWrite("dismissSharedGadget", u => u.forgetSharedGadget(gadgetId));
   }
 
   async listOwnBlueprints(): Promise<BlueprintUserSummary[]> {
-    return this.user.listBlueprints();
+    return this.#userRead("listOwnBlueprints", u => u.listBlueprints());
   }
 
   async getOwnBlueprint(blueprintId: string): Promise<BlueprintUserSummary | null> {
-    return this.user.getBlueprint(blueprintId);
+    return this.#userRead("getOwnBlueprint", u => u.getBlueprint(blueprintId));
   }
 
   async listLibraryBlueprints(): Promise<BlueprintLibrarySummary[]> {
-    return this.user.listLibraryBlueprints();
+    return this.#userRead("listLibraryBlueprints", u => u.listLibraryBlueprints());
   }
 
   async setBlueprintPinned(blueprintId: string, pinned: boolean): Promise<void> {
-    return this.user.setBlueprintPinned(blueprintId, pinned);
+    return this.#userWrite("setBlueprintPinned", u => u.setBlueprintPinned(blueprintId, pinned));
   }
 
   async isBlueprintPinned(blueprintId: string): Promise<boolean> {
-    return this.user.isBlueprintPinned(blueprintId);
+    return this.#userRead("isBlueprintPinned", u => u.isBlueprintPinned(blueprintId));
   }
 
   async listFeaturedBlueprints(): Promise<BlueprintPublicInfo[]> {
@@ -369,15 +611,16 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   }
 
   async addBlueprintToLibrary(blueprintId: string): Promise<void> {
-    return this.user.addBlueprintToLibrary(blueprintId);
+    return this.#userWrite("addBlueprintToLibrary", u => u.addBlueprintToLibrary(blueprintId));
   }
 
   async removeBlueprintFromLibrary(blueprintId: string): Promise<void> {
-    return this.user.removeBlueprintFromLibrary(blueprintId);
+    return this.#userWrite("removeBlueprintFromLibrary",
+        u => u.removeBlueprintFromLibrary(blueprintId));
   }
 
   isBlueprintInLibrary(blueprintId: string): Promise<{ uploaded: boolean } | null> {
-    return this.user.isBlueprintInLibrary(blueprintId);
+    return this.#userRead("isBlueprintInLibrary", u => u.isBlueprintInLibrary(blueprintId));
   }
 
   async importBlueprint(archive: ReadableStream<Uint8Array>): Promise<string> {
@@ -396,16 +639,16 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
 
       let kvRecord: BlueprintKvRecord = {
         metadata,
-        ownerId: this.user.id.toString(),
+        ownerId: this.#userId.toString(),
       };
 
       await this.env.BLUEPRINTS.put(blueprintId, JSON.stringify(kvRecord));
 
-      await this.user.importBlueprint(blueprintId, metadata);
+      await this.#userWrite("importBlueprint", u => u.importBlueprint(blueprintId, metadata));
 
       recordAnalytics(this.ctx, this.env, {
         event_name: "blueprint_imported",
-        user_id: this.user.id.toString(),
+        user_id: this.#userId.toString(),
         blueprint_id: blueprintId,
       });
 
@@ -433,7 +676,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
 
     // 3. Create new Overseer DO (same as newGadget()).
     let id = this.overseers.newUniqueId().toString();
-    await this.user.newGadget(id, kvRecord.metadata.title);
+    await this.#userWrite("newGadgetFromBlueprint", u => u.newGadget(id, kvRecord.metadata.title));
     let overseerResult = await this.#openGadgetInternal(id);
 
     // 4. Initialize from blueprint code.
@@ -527,7 +770,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
 
     recordAnalytics(this.ctx, this.env, {
       event_name: "gadget_created",
-      user_id: this.user.id.toString(),
+      user_id: this.#userId.toString(),
       gadget_id: id,
       blueprint_id: blueprintId,
       source: "blueprint",
@@ -539,7 +782,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   }
 
   async deleteOrphanedBlueprint(blueprintId: string): Promise<void> {
-    return this.user.deleteOwnedBlueprint(blueprintId);
+    return this.#userWrite("deleteOrphanedBlueprint", u => u.deleteOwnedBlueprint(blueprintId));
   }
 
   // --- Gatekeeper management apps ---
@@ -549,9 +792,12 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   // vendor id, e.g. "context"), so each app is hosted at /gatekeepers/<vendorId>. UI-providing
   // accounts are auto-provisioned singletons (one per vendor), so the vendor id identifies them.
   async listGatekeeperApps(): Promise<GatekeeperAppInfo[]> {
-    // listProvidedAccounts provisions auto-provisioned accounts first (idempotent), so their apps
-    // appear in the nav even before the user opens a gadget — in a single round trip.
-    let accounts = await this.user.listProvidedAccounts();
+    // listProvidedAccounts provisions auto-provisioned accounts first, so their apps appear in
+    // the nav even before the user opens a gadget — in a single round trip. #userWrite, not
+    // #userRead: provisioning calls the vendor's createAccount BEFORE the record persists, so a
+    // reset in that window followed by a retry would create a duplicate vendor-side account
+    // (the DO's dedup promise is in-memory and dies with the reset). Same in getGatekeeperApp.
+    let accounts = await this.#userWrite("listGatekeeperApps", u => u.listProvidedAccounts());
     return accounts
         .filter(account => account.description.providesUi)
         .map(account => ({
@@ -562,13 +808,17 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   }
 
   async getGatekeeperApp(id: string): Promise<GatekeeperUiFrame | null> {
-    // Self-sufficient: listProvidedAccounts provisions auto-provisioned accounts first (idempotent),
-    // so a direct URL load of /gatekeepers/$id works without racing the Header's listGatekeeperApps.
-    let accounts = await this.user.listProvidedAccounts();
-    let app = accounts.find(account => account.vendorId === id && account.description.providesUi);
-    if (!app) return null;
-    // isAdmin is supplied fresh per open so admin-gated features reflect the user's current status.
-    return this.user.startAccountAppUi(app.accountId, { isAdmin: this.#isAdmin() });
+    // Self-sufficient: listProvidedAccounts provisions auto-provisioned accounts first, so a
+    // direct URL load of /gatekeepers/$id works without racing the Header's listGatekeeperApps.
+    // #userWrite because of that provisioning side effect (see listGatekeeperApps); both DO
+    // calls share one closure so they reach the same stub/incarnation.
+    return this.#userWrite("getGatekeeperApp", async u => {
+      let accounts = await u.listProvidedAccounts();
+      let app = accounts.find(account => account.vendorId === id && account.description.providesUi);
+      if (!app) return null;
+      // isAdmin is supplied fresh per open so admin-gated features reflect the user's current status.
+      return u.startAccountAppUi(app.accountId, { isAdmin: this.#isAdmin() });
+    });
   }
 
   // --- Deployment admin ---
@@ -581,7 +831,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     if (!this.#isAdmin()) return null;
     // #isAdmin() guarantees a non-empty user id name. Forwarded to gatekeepers when listing the
     // resource catalog so RBAC-gated ones still surface for this admin.
-    let adminUserId = this.user.id.name!;
+    let adminUserId = this.#userId.name!;
     // @ts-expect-error Cap'n Web RPC stubs and native RPC targets are compatible but the type
     //     system doesn't know this.
     return new AdminApiImpl(this.adminSettings.getByName(""), adminUserId);
@@ -664,30 +914,30 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
   async authenticate(token: string): Promise<AuthenticatedApi> {
     let split = token.split(':');
     if (split.length !== 2) {
-      throw new Error("Invalid session token.");
+      throw createAuthError(AUTH_ERROR_CODES.invalidSessionToken);
     }
 
     let userId = this.users.idFromName(split[0]);
-    let stub = this.users.get(userId);
-    await stub.authenticate(split[1]);
+    // Token verification is an idempotent read; fresh stub per attempt.
+    await retryOnDoReset(() => this.users.get(userId).authenticate(split[1]));
     recordAnalytics(this.ctx, this.env, {
       event_name: "user_authenticated",
       user_id: userId.toString(),
       source: "session_token",
     });
-    return new AuthenticatedApiImpl(this.ctx, this.env, stub, this.abortSession);
+    return new AuthenticatedApiImpl(this.ctx, this.env, userId, this.abortSession);
   }
 
   async authenticateFromCfAccess(): Promise<AuthenticatedApi> {
     if (!this.accessPayload) {
-      throw new Error("Not authenticated with Access.");
+      throw createAuthError(AUTH_ERROR_CODES.notAuthenticatedWithAccess);
     }
 
     let email = this.accessPayload.email as string;
     let userId = this.users.idFromName(email);
-    let stub = this.users.get(userId);
     let signupsEnabled = (await readAdminConfig(this.env)).signupsEnabled;
-    let accountCreated = await stub.authenticateFromCfAccess(email, signupsEnabled);
+    let accountCreated =
+        await this.users.get(userId).authenticateFromCfAccess(email, signupsEnabled);
     if (accountCreated) {
       recordAnalytics(this.ctx, this.env, {
         event_name: "account_created",
@@ -700,7 +950,7 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
       user_id: userId.toString(),
       source: "cf_access",
     });
-    return new AuthenticatedApiImpl(this.ctx, this.env, stub, this.abortSession);
+    return new AuthenticatedApiImpl(this.ctx, this.env, userId, this.abortSession);
   }
 
   async login(username: string, passwordHash: Uint8Array): Promise<string | null> {
