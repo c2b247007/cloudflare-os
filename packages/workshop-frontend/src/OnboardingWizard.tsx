@@ -1,3 +1,4 @@
+import { logRpcFailure } from './rpcErrors'
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useKumoToastManager } from '@cloudflare/kumo'
 import { RpcTarget } from 'capnweb'
@@ -186,6 +187,11 @@ export default function OnboardingWizard({
         if (!cancelled) setVendorsLoading(false)
       })
 
+    // Ids seen since the last ready(); on ready(), accounts not re-sent are pruned via the
+    // same logic as remove() — a post-reset recovery replay omits accounts disconnected while
+    // the registration was dead (same pattern as ResourcePicker).
+    const seenIds = new Set<number>()
+
     class AccountsSubscriber extends RpcTarget implements ConnectedAccountsSubscriber {
       add(
         id: number,
@@ -196,6 +202,7 @@ export default function OnboardingWizard({
         _vendorId: string = '',
       ) {
         if (cancelled) return
+        seenIds.add(id)
         const url = vendor.url
         accountIdToUrl.set(id, url)
         connectedUrls.add(url)
@@ -206,6 +213,7 @@ export default function OnboardingWizard({
         }
       }
       remove(id: number) {
+        seenIds.delete(id)
         const url = accountIdToUrl.get(id)
         if (url) {
           accountIdToUrl.delete(id)
@@ -214,14 +222,18 @@ export default function OnboardingWizard({
           refreshConnectedIds()
         }
       }
-      ready() {}
+      ready() {
+        for (const id of [...accountIdToUrl.keys()]) {
+          if (!seenIds.has(id)) this.remove(id)
+        }
+        seenIds.clear()
+      }
     }
 
     const subscriber = new AccountsSubscriber()
     let subscriptionStub: { [Symbol.dispose](): void } | null = null
 
-    authenticatedApi
-      .subscribeConnectedAccounts(subscriber)
+    authenticatedApi.subscribeConnectedAccounts(subscriber)
       .then((stub) => {
         if (cancelled) {
           stub[Symbol.dispose]()
@@ -230,7 +242,7 @@ export default function OnboardingWizard({
         }
       })
       .catch((err) => {
-        console.error('Failed to subscribe to connected accounts:', err)
+        logRpcFailure('Failed to subscribe to connected accounts:', err)
       })
 
     return () => {

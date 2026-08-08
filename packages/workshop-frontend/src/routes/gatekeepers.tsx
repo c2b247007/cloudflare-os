@@ -1,3 +1,4 @@
+import { logRpcFailure } from '../rpcErrors'
 import { createFileRoute } from '@tanstack/react-router'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useKumoToastManager } from '@cloudflare/kumo'
@@ -482,17 +483,15 @@ function ConnectorsPage() {
     setAccountsLoaded(false)
     setVendorsLoaded(false)
 
-    authenticatedApi
-      .listAddableGatekeepers()
+    authenticatedApi.listAddableGatekeepers()
       .then((list) => {
         if (!cancelled) setAddable(list)
       })
       .catch((err) => {
-        console.error('Failed to load addable gatekeepers:', err)
+        logRpcFailure('Failed to load addable gatekeepers:', err)
       })
 
-    authenticatedApi
-      .listGatekeeperVendors()
+    authenticatedApi.listGatekeeperVendors()
       .then((vendorList) => {
         if (cancelled) return
         const unavailable = vendorList.filter((v) => v.unavailable)
@@ -514,9 +513,14 @@ function ConnectorsPage() {
         setVendorsLoaded(true)
       })
       .catch((err) => {
-        console.error('Failed to load available services:', err)
+        logRpcFailure('Failed to load available services:', err)
         if (!cancelled) setLoadError(true)
       })
+
+    // Ids seen since the last ready(). After a Durable Object reset the recovered subscription
+    // replays every current account then ready(); pruning what wasn't re-sent drops accounts
+    // that were disconnected while the registration was dead (same pattern as ResourcePicker).
+    const seenIds = new Set<number>()
 
     class AccountsSubscriber
       extends RpcTarget
@@ -531,6 +535,7 @@ function ConnectorsPage() {
         vendorId: string = '',
       ) {
         if (cancelled) return
+        seenIds.add(id)
         accountMap.set(id, {
           id,
           accountDescription: description,
@@ -542,18 +547,25 @@ function ConnectorsPage() {
         setAccounts(Array.from(accountMap.values()))
       }
       remove(id: number) {
+        seenIds.delete(id)
         accountMap.delete(id)
         if (!cancelled) setAccounts(Array.from(accountMap.values()))
       }
       ready() {
-        if (!cancelled) setAccountsLoaded(true)
+        for (const id of [...accountMap.keys()]) {
+          if (!seenIds.has(id)) accountMap.delete(id)
+        }
+        seenIds.clear()
+        if (!cancelled) {
+          setAccounts(Array.from(accountMap.values()))
+          setAccountsLoaded(true)
+        }
       }
     }
 
     const subscriber = new AccountsSubscriber()
 
-    authenticatedApi
-      .subscribeConnectedAccounts(subscriber)
+    authenticatedApi.subscribeConnectedAccounts(subscriber)
       .then((stub) => {
         if (cancelled) {
           stub[Symbol.dispose]()
@@ -562,7 +574,7 @@ function ConnectorsPage() {
         }
       })
       .catch((err) => {
-        console.error('Failed to subscribe to connected accounts:', err)
+        logRpcFailure('Failed to subscribe to connected accounts:', err)
         if (!cancelled) setLoadError(true)
       })
 

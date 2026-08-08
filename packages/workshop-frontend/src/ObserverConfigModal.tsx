@@ -150,6 +150,8 @@ export default function ObserverConfigModal({
         subStub = stub
       })
       .catch(err => {
+        // Loud on purpose: the modal has no retry path, so a quieted transient failure would
+        // strand the user on a permanent loader.
         console.error('Failed to subscribe to connected accounts:', err)
         toasts.add({ title: 'Failed to load your connected accounts', variant: 'error' })
       })

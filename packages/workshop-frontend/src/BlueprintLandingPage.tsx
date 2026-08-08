@@ -1,3 +1,4 @@
+import { logRpcFailure } from './rpcErrors'
 import { useState, useEffect, useCallback, useMemo, useRef, type ReactNode } from 'react'
 import { useNavigate, useParams, useRouter } from '@tanstack/react-router'
 import { RpcStub, RpcTarget } from 'capnweb'
@@ -120,7 +121,9 @@ export default function BlueprintLandingPage({ rpcStub }: Props) {
   // When authenticated, fetch models for binding assignment.
   useEffect(() => {
     if (isAuthenticated && authenticatedApi) {
-      authenticatedApi.listModels().then(setModels).catch(console.error)
+      authenticatedApi.listModels()
+        .then(setModels)
+        .catch(err => logRpcFailure('Failed to load models:', err))
     } else {
       setModels([])
     }
@@ -154,6 +157,11 @@ export default function BlueprintLandingPage({ rpcStub }: Props) {
     const accountMap = new Map<number, AccountOption>()
     let subStub: { [Symbol.dispose](): void } | null = null
 
+    // Ids seen since the last ready(); on ready(), accounts not re-sent are pruned — a
+    // post-reset recovery replay omits accounts disconnected while the registration was dead
+    // (same pattern as ResourcePicker).
+    const seenIds = new Set<number>()
+
     class AccountsSubscriber extends RpcTarget implements ConnectedAccountsSubscriber {
       add(
         accountId: number,
@@ -164,6 +172,7 @@ export default function BlueprintLandingPage({ rpcStub }: Props) {
         vendorId: string = '',
       ) {
         if (cancelled) return
+        seenIds.add(accountId)
         accountMap.set(accountId, {
           id: accountId, description, vendorId, vendorDescription: vendor,
           supportedResources, credentialsValid,
@@ -174,11 +183,18 @@ export default function BlueprintLandingPage({ rpcStub }: Props) {
         }
       }
       remove(accountId: number) {
+        seenIds.delete(accountId)
         if (cancelled) return
         accountMap.delete(accountId)
         setAccounts(Array.from(accountMap.values()))
       }
-      ready() {}
+      ready() {
+        for (const id of [...accountMap.keys()]) {
+          if (!seenIds.has(id)) accountMap.delete(id)
+        }
+        seenIds.clear()
+        if (!cancelled) setAccounts(Array.from(accountMap.values()))
+      }
     }
 
     authenticatedApi.subscribeConnectedAccounts(new AccountsSubscriber())
@@ -190,7 +206,7 @@ export default function BlueprintLandingPage({ rpcStub }: Props) {
         }
       })
       .catch(err => {
-        console.error('Failed to subscribe to connected accounts:', err)
+        logRpcFailure('Failed to subscribe to connected accounts:', err)
       })
 
     return () => {

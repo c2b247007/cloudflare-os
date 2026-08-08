@@ -1,3 +1,4 @@
+import { logRpcFailure } from './rpcErrors'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Dialog, useKumoToastManager, type PortalContainer } from '@cloudflare/kumo'
 import {
@@ -407,6 +408,11 @@ export default function GatekeeperModal({
     let cancelled = false
     const accountMap = new Map<number, AccountOption>()
 
+    // Ids seen since the last ready(); on ready(), accounts not re-sent are pruned — a
+    // post-reset recovery replay omits accounts disconnected while the registration was dead
+    // (same pattern as ResourcePicker).
+    const seenIds = new Set<number>()
+
     class AccountsSubscriber extends RpcTarget implements ConnectedAccountsSubscriber {
       add(
         id: number,
@@ -417,17 +423,25 @@ export default function GatekeeperModal({
         vendorId: string = '',
       ) {
         if (cancelled) return
+        seenIds.add(id)
         accountMap.set(id, { id, description, vendorId, vendorDescription: vendor, supportedResources, credentialsValid })
         setAccounts(Array.from(accountMap.values()))
       }
 
       remove(id: number) {
+        seenIds.delete(id)
         if (cancelled) return
         accountMap.delete(id)
         setAccounts(Array.from(accountMap.values()))
       }
 
-      ready() {}
+      ready() {
+        for (const id of [...accountMap.keys()]) {
+          if (!seenIds.has(id)) accountMap.delete(id)
+        }
+        seenIds.clear()
+        if (!cancelled) setAccounts(Array.from(accountMap.values()))
+      }
     }
 
     const subscriber = new AccountsSubscriber()
@@ -440,7 +454,7 @@ export default function GatekeeperModal({
         }
       })
       .catch(error => {
-        console.error('Failed to subscribe to connected accounts:', error)
+        logRpcFailure('Failed to subscribe to connected accounts:', error)
       })
 
     return () => {
