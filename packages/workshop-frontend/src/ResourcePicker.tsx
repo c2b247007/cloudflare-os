@@ -1,3 +1,4 @@
+import { logRpcFailure } from './rpcErrors'
 import { useState, useEffect, useRef, useMemo, useCallback, type MutableRefObject } from 'react'
 import { Tooltip, useKumoToastManager } from '@cloudflare/kumo'
 import { Plus, CaretRight, Warning } from '@phosphor-icons/react'
@@ -111,6 +112,7 @@ export default function ResourcePicker({
 
   // Subscribe to connected accounts on mount.
   useEffect(() => {
+    let cancelled = false
     seenAccountIdsRef.current = new Set()
 
     class AccountsSubscriber extends RpcTarget implements ConnectedAccountsSubscriber {
@@ -158,16 +160,18 @@ export default function ResourcePicker({
     const subscribe = async () => {
       try {
         const stub = await authenticatedApi.subscribeConnectedAccounts(subscriber)
-        subscriptionRef.current = { stub }
+        if (cancelled) stub[Symbol.dispose]()
+        else subscriptionRef.current = { stub }
       } catch (error) {
-        console.error('Failed to subscribe to connected accounts:', error)
+        logRpcFailure('Failed to subscribe to connected accounts:', error)
         // Nothing more is coming, so show what we have rather than hiding forever.
-        setAccountsLoaded(true)
+        if (!cancelled) setAccountsLoaded(true)
       }
     }
     subscribe()
 
     return () => {
+      cancelled = true
       if (subscriptionRef.current) {
         subscriptionRef.current.stub[Symbol.dispose]()
         subscriptionRef.current = null
